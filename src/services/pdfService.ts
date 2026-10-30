@@ -3,22 +3,6 @@ import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { translateText } from './translationService';
 
-// Fetch a font that supports Arabic characters
-async function fetchArabicFont(): Promise<ArrayBuffer> {
-  try {
-    // Use Noto Sans Arabic from Google Fonts
-    const response = await fetch(
-      'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosansarabic/NotoSansArabic%5Bwdth%2Cwght%5D.ttf'
-    );
-    if (response.ok) {
-      return await response.arrayBuffer();
-    }
-  } catch (e) {
-    console.warn('Could not fetch Arabic font, will use fallback');
-  }
-  return null as unknown as ArrayBuffer;
-}
-
 // Configure PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js`;
 
@@ -41,7 +25,7 @@ export interface TextItem {
 }
 
 export interface ImageData {
-  data: Uint8Array;
+  imgData: Uint8Array;
   x: number;
   y: number;
   width: number;
@@ -55,10 +39,19 @@ export interface TranslationProgress {
   message: string;
 }
 
+export interface TranslationStats {
+  totalPages: number;
+  totalWords: number;
+  totalCharacters: number;
+  translatedWords: number;
+  processingTime: number;
+}
+
 export async function extractPdfContent(
   file: File,
   onProgress?: (progress: TranslationProgress) => void
-): Promise<{ pages: PageData[]; pdfBytes: ArrayBuffer }> {
+): Promise<{ pages: PageData[]; pdfBytes: ArrayBuffer; stats: TranslationStats }> {
+  const startTime = Date.now();
   const arrayBuffer = await file.arrayBuffer();
   const pdfBytes = arrayBuffer.slice(0);
   
@@ -72,6 +65,8 @@ export async function extractPdfContent(
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const numPages = pdf.numPages;
   const pages: PageData[] = [];
+  let totalWords = 0;
+  let totalCharacters = 0;
 
   for (let i = 1; i <= numPages; i++) {
     onProgress?.({
@@ -97,13 +92,14 @@ export async function extractPdfContent(
         fontName: item.fontName || ''
       }));
 
+    // Count words and characters
+    const pageText = textItems.map(item => item.text).join(' ');
+    totalWords += pageText.split(/\s+/).filter(w => w.length > 0).length;
+    totalCharacters += pageText.length;
+
     // Extract images from the page
     const images: ImageData[] = [];
     try {
-      const operatorList = await page.getOperatorList();
-      const ops = operatorList;
-      
-      // Get page canvas for image extraction
       const canvas = document.createElement('canvas');
       canvas.width = viewport.width;
       canvas.height = viewport.height;
@@ -111,19 +107,19 @@ export async function extractPdfContent(
       
       await page.render({ canvasContext: ctx, viewport }).promise;
       
-      // Store the rendered page as an image
       const imageData = canvas.toDataURL('image/png');
       const response = await fetch(imageData);
       const blob = await response.blob();
       const imgBuffer = await blob.arrayBuffer();
       
-      images.push({
-        data: new Uint8Array(imgBuffer),
+      const imgData = {
+        imgData: new Uint8Array(imgBuffer),
         x: 0,
         y: 0,
         width: viewport.width,
         height: viewport.height
-      });
+      };
+      images.push(imgData);
     } catch (e) {
       console.warn('Could not extract images from page', i, e);
     }
@@ -137,11 +133,22 @@ export async function extractPdfContent(
     });
   }
 
-  return { pages, pdfBytes };
+  const stats: TranslationStats = {
+    totalPages: numPages,
+    totalWords,
+    totalCharacters,
+    translatedWords: 0,
+    processingTime: 0
+  };
+
+  return { pages, pdfBytes, stats };
 }
 
 export async function translatePages(
   pages: PageData[],
+  sourceLang: string,
+  targetLang: string,
+  glossary: Record<string, string>,
   onProgress?: (progress: TranslationProgress) => void
 ): Promise<PageData[]> {
   const translatedPages: PageData[] = [];
@@ -160,10 +167,29 @@ export async function translatePages(
         message: `جاري ترجمة النص... (${completedItems}/${totalTextItems})`
       });
 
-      const translated = await translateText(item.text, 'ja', 'ar');
+      // Apply glossary replacements first
+      let textToTranslate = item.text;
+      const glossaryReplacements: Array<{ original: string; translated: string; placeholder: string }> = [];
+      
+      Object.entries(glossary).forEach(([key, value], idx) => {
+        if (textToTranslate.toLowerCase().includes(key.toLowerCase())) {
+          const placeholder = `__GLOSSARY_${idx}__`;
+          glossaryReplacements.push({ original: key, translated: value, placeholder });
+          textToTranslate = textToTranslate.replace(new RegExp(key, 'gi'), placeholder);
+        }
+      });
+
+      const translated = await translateText(textToTranslate, sourceLang, targetLang);
+      
+      // Restore glossary terms
+      let finalText = translated;
+      glossaryReplacements.forEach(({ translated: glossaryValue, placeholder }) => {
+        finalText = finalText.replace(placeholder, glossaryValue);
+      });
+
       translatedTextItems.push({
         ...item,
-        text: translated
+        text: finalText
       });
       
       completedItems++;
@@ -190,10 +216,7 @@ export async function generateTranslatedPdf(
     message: 'جاري إنشاء الملف المترجم...'
   });
 
-  // Load the original PDF to preserve images
   const pdfDoc = await PDFDocument.load(originalPdfBytes);
-  
-  // Try to embed a font that supports Arabic
   pdfDoc.registerFontkit(fontkit);
   
   let arabicFont = null;
@@ -201,22 +224,23 @@ export async function generateTranslatedPdf(
   
   // Try to load Arabic font
   try {
-    const fontBuffer = await fetchArabicFont();
-    if (fontBuffer) {
+    const response = await fetch(
+      'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosansarabic/NotoSansArabic%5Bwdth%2Cwght%5D.ttf'
+    );
+    if (response.ok) {
+      const fontBuffer = await response.arrayBuffer();
       arabicFont = await pdfDoc.embedFont(fontBuffer);
     }
   } catch (e) {
     console.warn('Could not embed Arabic font');
   }
   
-  // Fallback to Helvetica
   try {
     helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
   } catch (e) {
     helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
   }
   
-  // Use Arabic font if available, otherwise fallback
   const textFont = arabicFont || helveticaFont;
 
   const pages = pdfDoc.getPages();
@@ -233,9 +257,8 @@ export async function generateTranslatedPdf(
     const translatedPage = translatedPages[i];
     const { width, height } = page.getSize();
 
-    // Add white background overlay for text areas
     if (translatedPage.textItems.length > 0) {
-      // Draw semi-transparent white rectangles behind text
+      // Draw white background behind text
       for (const item of translatedPage.textItems) {
         page.drawRectangle({
           x: item.x - 2,
@@ -243,7 +266,7 @@ export async function generateTranslatedPdf(
           width: Math.max(item.width + 4, 50),
           height: item.height + 4,
           color: rgb(1, 1, 1),
-          opacity: 0.9
+          opacity: 0.92
         });
       }
 
@@ -257,7 +280,6 @@ export async function generateTranslatedPdf(
           textWidth = item.width;
         }
         
-        // Adjust position for RTL text
         const adjustedX = Math.max(item.x, item.x + item.width - textWidth);
         
         try {
@@ -269,7 +291,6 @@ export async function generateTranslatedPdf(
             color: rgb(0.1, 0.1, 0.1)
           });
         } catch (e) {
-          // If text can't be drawn (unsupported characters), try with helvetica
           try {
             page.drawText(item.text, {
               x: adjustedX,
@@ -292,6 +313,18 @@ export async function generateTranslatedPdf(
 
 export function downloadPdf(bytes: Uint8Array, filename: string) {
   const blob = new Blob([bytes as unknown as BlobPart], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export function downloadText(content: string, filename: string) {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
